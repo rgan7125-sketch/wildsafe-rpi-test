@@ -4,17 +4,21 @@ import os
 import signal
 import subprocess
 import time
+import traceback
 from typing import Optional
 
 import board
 import httpx
 import neopixel
+import websockets
 from aiortc import RTCPeerConnection, RTCRtpSender, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer
 
 
 ML_WEBRTC_OFFER_URL = "https://wildsafe-ml-service.onrender.com/predict/webrtc/offer"
+ML_HEALTH_URL = "https://wildsafe-ml-service.onrender.com/health"
 ORCHESTRATOR_EVENTS_URL = "https://smart-wild.onrender.com/events"
+ORCHESTRATOR_WS_URL = "wss://smart-wild.onrender.com/handshake"
 
 PIXEL_PIN = board.D18
 NUM_PIXELS = 9
@@ -29,7 +33,6 @@ LONGITUDE = -122.4194
 ROAD_NAME = "CA-1"
 DIRECTION = "northbound"
 MILE_MARKER = "12.4"
-
 
 pixels = neopixel.NeoPixel(
     PIXEL_PIN,
@@ -93,7 +96,8 @@ def alert_hardware(freq_hz: int):
 def prefer_h264(transceiver):
     capabilities = RTCRtpSender.getCapabilities("video")
     h264_codecs = [
-        codec for codec in capabilities.codecs if codec.mimeType.lower() == "video/h264"
+        codec for codec in capabilities.codecs
+        if codec.mimeType.lower() == "video/h264"
     ]
     if h264_codecs:
         transceiver.setCodecPreferences(h264_codecs)
@@ -116,11 +120,41 @@ async def wait_for_ice_gathering(pc: RTCPeerConnection):
         print("ICE gathering timed out; sending current WebRTC offer")
 
 
+async def wait_for_ml_service():
+    print("Warming ML service before WebRTC offer")
+    timeout = httpx.Timeout(connect=10, read=60, write=10, pool=10)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(1, 13):
+            try:
+                response = await client.get(ML_HEALTH_URL)
+                response.raise_for_status()
+                print("ML service is reachable")
+                return
+            except Exception as exc:
+                delay = min(5 * attempt, 30)
+                print(
+                    f"ML service not ready yet "
+                    f"(attempt {attempt}/12): {repr(exc)}; retrying in {delay}s"
+                )
+                await asyncio.sleep(delay)
+
+    raise RuntimeError("ML service did not become reachable")
+
+
+async def wait_for_webrtc_disconnect(pc: RTCPeerConnection):
+    while pc.connectionState not in {"failed", "disconnected", "closed"}:
+        await asyncio.sleep(5)
+
+    raise RuntimeError(f"WebRTC connection ended: {pc.connectionState}")
+
+
 async def start_webrtc_stream():
     global peer_connection, rpicam_process
 
     if peer_connection is not None:
         return
+
+    await wait_for_ml_service()
 
     rpicam_process = subprocess.Popen(
         [
@@ -142,6 +176,11 @@ async def start_webrtc_stream():
 
     pc = RTCPeerConnection()
     peer_connection = pc
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"WebRTC connection state: {pc.connectionState}")
+
     transceiver = pc.addTransceiver(player.video, direction="sendonly")
     prefer_h264(transceiver)
 
@@ -163,22 +202,34 @@ async def start_webrtc_stream():
         "use_pose_detection": False,
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    timeout = httpx.Timeout(connect=20, read=180, write=20, pool=20)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(ML_WEBRTC_OFFER_URL, json=payload)
         response.raise_for_status()
         answer = response.json()
 
     await pc.setRemoteDescription(
-        RTCSessionDescription(sdp=answer["sdp"], type=answer.get("type", "answer"))
+        RTCSessionDescription(
+            sdp=answer["sdp"],
+            type=answer.get("type", "answer"),
+        )
     )
     print(f"Streaming WebRTC video. stream_id={answer.get('stream_id')}")
+    await wait_for_webrtc_disconnect(pc)
 
 
 async def start_webrtc_stream_with_log():
-    try:
-        await start_webrtc_stream()
-    except Exception as exc:
-        print(f"WebRTC stream failed: {exc}")
+    retry_delay = 5
+    while True:
+        try:
+            await cleanup()
+            await start_webrtc_stream()
+        except Exception as exc:
+            print(f"WebRTC stream failed: {repr(exc)}")
+            traceback.print_exc()
+            print(f"Retrying WebRTC startup in {retry_delay}s")
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
 
 
 def incident_frequency(incident: dict) -> Optional[int]:
@@ -193,54 +244,118 @@ def incident_frequency(incident: dict) -> Optional[int]:
     return INCIDENT_FREQUENCIES.get(incident.get("type"))
 
 
+async def process_incident(raw_data: str):
+    print(f"Received incident event: {raw_data}")
+
+    try:
+        incident = json.loads(raw_data)
+        frequency = incident_frequency(incident)
+        if frequency:
+            print(f"Triggering hardware alert at {frequency} Hz")
+            await asyncio.to_thread(alert_hardware, frequency)
+        else:
+            print(
+                "Incident received, but camera_id did not match "
+                "or no frequency was available"
+            )
+    except Exception as inner_exc:
+        print(f"Failed to process incident payload: {repr(inner_exc)}")
+        traceback.print_exc()
+
+
+async def listen_for_alerts_sse():
+    timeout = httpx.Timeout(connect=10, read=35, write=10, pool=10)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("GET", ORCHESTRATOR_EVENTS_URL) as response:
+            response.raise_for_status()
+            print("Connected to SSE alert stream")
+
+            event_name = "message"
+            data_lines = []
+
+            async for line in response.aiter_lines():
+                if line == "":
+                    if event_name == "incident" and data_lines:
+                        await process_incident("\n".join(data_lines))
+
+                    event_name = "message"
+                    data_lines = []
+                    continue
+
+                if line.startswith(":"):
+                    continue
+
+                if line.startswith("event:"):
+                    event_name = line[len("event:") :].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[len("data:") :].strip())
+
+
+async def listen_for_alerts_websocket():
+    async with websockets.connect(
+        ORCHESTRATOR_WS_URL,
+        ping_interval=20,
+        ping_timeout=20,
+    ) as websocket:
+        print("Connected to websocket alert stream")
+        async for message in websocket:
+            await process_incident(message)
+
+
 async def listen_for_alerts():
     while True:
         try:
-            async with httpx.AsyncClient(timeout=None) as client:
-                async with client.stream("GET", ORCHESTRATOR_EVENTS_URL) as response:
-                    response.raise_for_status()
-                    event_name = "message"
-                    data_lines = []
-
-                    async for line in response.aiter_lines():
-                        if line == "":
-                            if event_name == "incident" and data_lines:
-                                incident = json.loads("\n".join(data_lines))
-                                frequency = incident_frequency(incident)
-                                if frequency:
-                                    await asyncio.to_thread(alert_hardware, frequency)
-                            event_name = "message"
-                            data_lines = []
-                            continue
-
-                        if line.startswith(":"):
-                            continue
-                        if line.startswith("event:"):
-                            event_name = line[len("event:") :].strip()
-                        elif line.startswith("data:"):
-                            data_lines.append(line[len("data:") :].strip())
+            await listen_for_alerts_sse()
         except Exception as exc:
-            print(f"SSE alert stream disconnected: {exc}")
-            await asyncio.sleep(5)
+            print(f"SSE alert stream disconnected: {repr(exc)}")
+            traceback.print_exc()
+
+        try:
+            await listen_for_alerts_websocket()
+        except Exception as exc:
+            print(f"Websocket alert stream disconnected: {repr(exc)}")
+            traceback.print_exc()
+
+        print("Alert stream reconnecting in 2 seconds")
+        await asyncio.sleep(2)
 
 
-async def shutdown():
-    led_off()
+async def cleanup():
+    global peer_connection, rpicam_process
+
+    try:
+        led_off()
+    except Exception:
+        pass
+
     if peer_connection is not None:
         await peer_connection.close()
-    if rpicam_process is not None and rpicam_process.poll() is None:
-        rpicam_process.terminate()
+        peer_connection = None
+
+    if rpicam_process is not None:
+        if rpicam_process.poll() is None:
+            rpicam_process.terminate()
+            try:
+                rpicam_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rpicam_process.kill()
+        rpicam_process = None
 
 
 async def main():
     led_off()
-    video_task = asyncio.create_task(start_webrtc_stream_with_log())
+
+    webrtc_task = asyncio.create_task(start_webrtc_stream_with_log())
     alerts_task = asyncio.create_task(listen_for_alerts())
+
     try:
-        await asyncio.gather(video_task, alerts_task)
+        await asyncio.gather(webrtc_task, alerts_task)
     finally:
-        await shutdown()
+        await cleanup()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down firmware")

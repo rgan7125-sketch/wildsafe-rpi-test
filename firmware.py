@@ -11,7 +11,13 @@ import board
 import httpx
 import neopixel
 import websockets
-from aiortc import RTCPeerConnection, RTCRtpSender, RTCSessionDescription
+from aiortc import (
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCRtpSender,
+    RTCSessionDescription,
+)
 from aiortc.contrib.media import MediaPlayer
 
 
@@ -103,6 +109,23 @@ def prefer_h264(transceiver):
         transceiver.setCodecPreferences(h264_codecs)
 
 
+def load_ice_servers() -> list[RTCIceServer]:
+    raw_config = os.getenv("WEBRTC_ICE_SERVERS")
+    if raw_config:
+        servers = json.loads(raw_config)
+    else:
+        servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+
+    return [
+        RTCIceServer(
+            urls=server["urls"],
+            username=server.get("username"),
+            credential=server.get("credential"),
+        )
+        for server in servers
+    ]
+
+
 async def wait_for_ice_gathering(pc: RTCPeerConnection):
     if pc.iceGatheringState == "complete":
         return
@@ -174,7 +197,14 @@ async def start_webrtc_stream():
     if player.video is None:
         raise RuntimeError("rpicam-vid did not produce a video track")
 
-    pc = RTCPeerConnection()
+    ice_servers = load_ice_servers()
+    print(f"Using {len(ice_servers)} ICE server(s)")
+
+    pc = RTCPeerConnection(
+        configuration=RTCConfiguration(iceServers=ice_servers)
+        if ice_servers
+        else None
+    )
     peer_connection = pc
 
     @pc.on("connectionstatechange")

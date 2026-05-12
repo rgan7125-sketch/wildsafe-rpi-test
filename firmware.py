@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import signal
 import subprocess
@@ -8,14 +9,12 @@ from typing import Optional
 import board
 import httpx
 import neopixel
-import uvicorn
 from aiortc import RTCPeerConnection, RTCRtpSender, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 
 ML_WEBRTC_OFFER_URL = "https://wildsafe-ml-service.onrender.com/predict/webrtc/offer"
+ORCHESTRATOR_EVENTS_URL = "https://smart-wild.onrender.com/events"
 
 PIXEL_PIN = board.D18
 NUM_PIXELS = 9
@@ -40,24 +39,17 @@ pixels = neopixel.NeoPixel(
     pixel_order=ORDER,
 )
 
-app = FastAPI(title="Smart Wild RPi Firmware")
 peer_connection = None
 rpicam_process = None
 
 
-class AlertRequest(BaseModel):
-    frequency: Optional[int] = None
-    frequency_hz: Optional[int] = None
-    speaker_frequency_hz: Optional[int] = None
-
-    def get_frequency(self) -> int:
-        freq = self.frequency_hz or self.speaker_frequency_hz or self.frequency
-        if not freq:
-            raise HTTPException(
-                status_code=422,
-                detail="Expected frequency_hz, speaker_frequency_hz, or frequency",
-            )
-        return int(freq)
+INCIDENT_FREQUENCIES = {
+    "animal_on_road": 20000,
+    "person_on_road": 1000,
+    "stopped_vehicle": 1000,
+    "road_obstruction": 1000,
+    "unknown": 1000,
+}
 
 
 def led_off():
@@ -95,6 +87,7 @@ def alert_hardware(freq_hz: int):
         led_off()
         if tone.poll() is None:
             os.killpg(tone.pid, signal.SIGTERM)
+            tone.wait()
 
 
 def prefer_h264(transceiver):
@@ -188,13 +181,49 @@ async def start_webrtc_stream_with_log():
         print(f"WebRTC stream failed: {exc}")
 
 
-@app.on_event("startup")
-async def startup():
-    led_off()
-    asyncio.create_task(start_webrtc_stream_with_log())
+def incident_frequency(incident: dict) -> Optional[int]:
+    location = incident.get("location") or {}
+    if location.get("camera_id") != CAMERA_ID:
+        return None
+
+    frequency = incident.get("speaker_frequency_hz") or incident.get("frequency_hz")
+    if frequency:
+        return int(frequency)
+
+    return INCIDENT_FREQUENCIES.get(incident.get("type"))
 
 
-@app.on_event("shutdown")
+async def listen_for_alerts():
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", ORCHESTRATOR_EVENTS_URL) as response:
+                    response.raise_for_status()
+                    event_name = "message"
+                    data_lines = []
+
+                    async for line in response.aiter_lines():
+                        if line == "":
+                            if event_name == "incident" and data_lines:
+                                incident = json.loads("\n".join(data_lines))
+                                frequency = incident_frequency(incident)
+                                if frequency:
+                                    await asyncio.to_thread(alert_hardware, frequency)
+                            event_name = "message"
+                            data_lines = []
+                            continue
+
+                        if line.startswith(":"):
+                            continue
+                        if line.startswith("event:"):
+                            event_name = line[len("event:") :].strip()
+                        elif line.startswith("data:"):
+                            data_lines.append(line[len("data:") :].strip())
+        except Exception as exc:
+            print(f"SSE alert stream disconnected: {exc}")
+            await asyncio.sleep(5)
+
+
 async def shutdown():
     led_off()
     if peer_connection is not None:
@@ -203,17 +232,15 @@ async def shutdown():
         rpicam_process.terminate()
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/alert")
-async def alert(request: AlertRequest):
-    freq = request.get_frequency()
-    await asyncio.to_thread(alert_hardware, freq)
-    return {"status": "ok", "frequency_hz": freq}
+async def main():
+    led_off()
+    video_task = asyncio.create_task(start_webrtc_stream_with_log())
+    alerts_task = asyncio.create_task(listen_for_alerts())
+    try:
+        await asyncio.gather(video_task, alerts_task)
+    finally:
+        await shutdown()
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8090)
+    asyncio.run(main())

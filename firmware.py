@@ -19,6 +19,7 @@ from aiortc import (
     RTCSessionDescription,
 )
 from aiortc.contrib.media import MediaPlayer
+from aiortc.rtcicetransport import parse_stun_turn_uri
 
 
 ML_WEBRTC_OFFER_URL = "https://wildsafe-ml-service.onrender.com/predict/webrtc/offer"
@@ -109,6 +110,26 @@ def prefer_h264(transceiver):
         transceiver.setCodecPreferences(h264_codecs)
 
 
+def normalize_ice_urls(server: dict) -> list[str]:
+    raw_urls = server.get("urls", server.get("url"))
+    if raw_urls is None:
+        raise ValueError("ICE server entry must include 'urls' or 'url'")
+
+    urls = raw_urls if isinstance(raw_urls, list) else [raw_urls]
+    normalized_urls = []
+    for url in urls:
+        if not isinstance(url, str):
+            raise ValueError("ICE server urls must be strings")
+
+        if url.startswith("stun:") and "?transport=" in url:
+            url = url.split("?transport=", 1)[0]
+
+        parse_stun_turn_uri(url)
+        normalized_urls.append(url)
+
+    return normalized_urls
+
+
 def load_ice_servers() -> list[RTCIceServer]:
     raw_config = os.getenv("WEBRTC_ICE_SERVERS")
     if raw_config:
@@ -116,9 +137,12 @@ def load_ice_servers() -> list[RTCIceServer]:
     else:
         servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
 
+    if not isinstance(servers, list):
+        raise ValueError("WEBRTC_ICE_SERVERS must be a JSON array")
+
     return [
         RTCIceServer(
-            urls=server["urls"],
+            urls=normalize_ice_urls(server),
             username=server.get("username"),
             credential=server.get("credential"),
         )

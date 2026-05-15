@@ -347,6 +347,8 @@ async def start_webrtc_stream():
         "15",
         "--bitrate",
         "1000000",
+        "--libav-format",
+        "mpegts",
         "-o",
         "-",
     ]
@@ -361,10 +363,12 @@ async def start_webrtc_stream():
 
     player = MediaPlayer(
         rpicam_process.stdout,
-        format="h264",
+        format="mpegts",
         options={
             "fflags": "nobuffer",
             "flags": "low_delay",
+            "analyzeduration": "1000000",
+            "probesize": "32768",
         },
     )
     if player.video is None:

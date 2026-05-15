@@ -65,7 +65,7 @@ ML_HEALTH_URL = "https://wildsafe-ml-service-4z6c.onrender.com/health"
 ORCHESTRATOR_EVENTS_URL = "https://smart-wild.onrender.com/events"
 ORCHESTRATOR_WS_URL = "wss://smart-wild.onrender.com/handshake"
 
-PIXEL_PIN = board.D18
+PIXEL_PIN = board.D17
 NUM_PIXELS = 9
 BRIGHTNESS = 0.15
 ORDER = neopixel.GRB

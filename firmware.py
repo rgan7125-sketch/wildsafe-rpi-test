@@ -92,6 +92,7 @@ pixels = neopixel.NeoPixel(
 
 peer_connection = None
 rpicam_process = None
+rpicam_monitor_task = None
 
 
 INCIDENT_FREQUENCIES = {
@@ -272,10 +273,36 @@ async def wait_for_ml_service():
 
 async def wait_for_webrtc_disconnect(pc: RTCPeerConnection):
     while pc.connectionState not in {"failed", "disconnected", "closed"}:
+        if rpicam_process is not None and rpicam_process.poll() is not None:
+            raise RuntimeError(
+                f"rpicam-vid exited while WebRTC was active: {rpicam_process.returncode}"
+            )
         await asyncio.sleep(5)
 
     logger.error("WebRTC connection ended state=%s", pc.connectionState)
     raise RuntimeError(f"WebRTC connection ended: {pc.connectionState}")
+
+
+async def monitor_rpicam_process(process: subprocess.Popen):
+    if process.stderr is None:
+        return
+
+    frame_status_lines = 0
+    try:
+        while True:
+            line = await asyncio.to_thread(process.stderr.readline)
+            if not line:
+                break
+            text = line.decode(errors="replace").rstrip()
+            if text.startswith("#"):
+                frame_status_lines += 1
+                if frame_status_lines == 1 or frame_status_lines % 60 == 0:
+                    logger.info("rpicam frame status: %s", text)
+                continue
+            logger.info("rpicam stderr: %s", text)
+    finally:
+        returncode = await asyncio.to_thread(process.wait)
+        logger.warning("rpicam-vid exited pid=%s returncode=%s", process.pid, returncode)
 
 
 def log_startup_config(ice_servers: list[RTCIceServer]):
@@ -296,7 +323,7 @@ def log_startup_config(ice_servers: list[RTCIceServer]):
 
 
 async def start_webrtc_stream():
-    global peer_connection, rpicam_process
+    global peer_connection, rpicam_monitor_task, rpicam_process
 
     if peer_connection is not None:
         logger.info("WebRTC startup skipped because peer connection already exists")
@@ -304,23 +331,42 @@ async def start_webrtc_stream():
 
     await wait_for_ml_service()
 
-    logger.info("Starting rpicam-vid process codec=h264 inline=true output=stdout")
+    rpicam_command = [
+        "rpicam-vid",
+        "-t",
+        "0",
+        "--codec",
+        "h264",
+        "--inline",
+        "--nopreview",
+        "--width",
+        "640",
+        "--height",
+        "480",
+        "--framerate",
+        "15",
+        "--bitrate",
+        "1000000",
+        "-o",
+        "-",
+    ]
+    logger.info("Starting rpicam-vid process command=%s", rpicam_command)
     rpicam_process = subprocess.Popen(
-        [
-            "rpicam-vid",
-            "-t",
-            "0",
-            "--codec",
-            "h264",
-            "--inline",
-            "-o",
-            "-",
-        ],
+        rpicam_command,
         stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     logger.info("rpicam-vid started pid=%s", rpicam_process.pid)
+    rpicam_monitor_task = asyncio.create_task(monitor_rpicam_process(rpicam_process))
 
-    player = MediaPlayer(rpicam_process.stdout, format="h264")
+    player = MediaPlayer(
+        rpicam_process.stdout,
+        format="h264",
+        options={
+            "fflags": "nobuffer",
+            "flags": "low_delay",
+        },
+    )
     if player.video is None:
         raise RuntimeError("rpicam-vid did not produce a video track")
     logger.info("MediaPlayer video track ready kind=%s", player.video.kind)
@@ -520,7 +566,7 @@ async def listen_for_alerts():
 
 
 async def cleanup():
-    global peer_connection, rpicam_process
+    global peer_connection, rpicam_monitor_task, rpicam_process
 
     logger.info("Cleanup started")
     try:
@@ -546,6 +592,10 @@ async def cleanup():
                 rpicam_process.kill()
                 logger.info("rpicam process killed pid=%s", rpicam_process.pid)
         rpicam_process = None
+    if rpicam_monitor_task is not None:
+        if not rpicam_monitor_task.done():
+            rpicam_monitor_task.cancel()
+        rpicam_monitor_task = None
     logger.info("Cleanup finished")
 
 

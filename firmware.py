@@ -65,7 +65,7 @@ ML_HEALTH_URL = "https://wildsafe-ml-service-4z6c.onrender.com/health"
 ORCHESTRATOR_EVENTS_URL = "https://smart-wild.onrender.com/events"
 ORCHESTRATOR_WS_URL = "wss://smart-wild.onrender.com/handshake"
 
-PIXEL_PIN = board.D17
+PIXEL_PIN = board.D18
 NUM_PIXELS = 9
 BRIGHTNESS = 0.15
 ORDER = neopixel.GRB
@@ -76,8 +76,8 @@ WEBRTC_CONFIDENCE_THRESHOLD = 0.1
 WEBRTC_USE_POSE_DETECTION = False
 
 CAMERA_ID = "rpi-roadside-001"
-LATITUDE = 37.7749
-LONGITUDE = -122.4194
+LATITUDE = float(os.getenv("RPI_LATITUDE", "37.7749"))
+LONGITUDE = float(os.getenv("RPI_LONGITUDE", "-122.4194"))
 ROAD_NAME = "CA-1"
 DIRECTION = "northbound"
 MILE_MARKER = "12.4"
@@ -347,8 +347,6 @@ async def start_webrtc_stream():
         "15",
         "--bitrate",
         "1000000",
-        "--libav-format",
-        "mpegts",
         "-o",
         "-",
     ]
@@ -356,20 +354,14 @@ async def start_webrtc_stream():
     rpicam_process = subprocess.Popen(
         rpicam_command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
     )
     logger.info("rpicam-vid started pid=%s", rpicam_process.pid)
-    rpicam_monitor_task = asyncio.create_task(monitor_rpicam_process(rpicam_process))
+    rpicam_monitor_task = None
 
     player = MediaPlayer(
         rpicam_process.stdout,
-        format="mpegts",
-        options={
-            "fflags": "nobuffer",
-            "flags": "low_delay",
-            "analyzeduration": "1000000",
-            "probesize": "32768",
-        },
+        format="h264",
     )
     if player.video is None:
         raise RuntimeError("rpicam-vid did not produce a video track")
@@ -596,10 +588,12 @@ async def cleanup():
                 rpicam_process.kill()
                 logger.info("rpicam process killed pid=%s", rpicam_process.pid)
         rpicam_process = None
+
     if rpicam_monitor_task is not None:
         if not rpicam_monitor_task.done():
             rpicam_monitor_task.cancel()
         rpicam_monitor_task = None
+
     logger.info("Cleanup finished")
 
 

@@ -75,7 +75,7 @@ WEBRTC_SAMPLE_FPS = 3.0
 WEBRTC_CONFIDENCE_THRESHOLD = 0.1
 WEBRTC_USE_POSE_DETECTION = False
 
-CAMERA_ID = "rpi-roadside-001"
+CAMERA_ID = os.getenv("RPI_CAMERA_ID", "rpi-roadside-001")
 LATITUDE = float(os.getenv("RPI_LATITUDE", "37.7749"))
 LONGITUDE = float(os.getenv("RPI_LONGITUDE", "-122.4194"))
 ROAD_NAME = "CA-1"
@@ -127,19 +127,33 @@ def alert_hardware(freq_hz: int):
         str(freq_hz),
     ]
 
+    logger.info(
+        "Hardware alert starting frequency_hz=%s duration_s=%s audio_device=%s command=%s",
+        freq_hz,
+        ALERT_SECONDS,
+        AUDIO_DEVICE,
+        command,
+    )
     tone = subprocess.Popen(command, start_new_session=True)
+    logger.info("speaker-test started pid=%s", tone.pid)
     try:
         end_at = time.monotonic() + ALERT_SECONDS
         on = True
+        flashes = 0
         while time.monotonic() < end_at:
             led_alert(on)
             on = not on
+            flashes += 1
             time.sleep(0.2)
+        logger.info("LED alert loop finished flashes=%s", flashes)
     finally:
         led_off()
+        logger.info("LED turned off after hardware alert")
         if tone.poll() is None:
+            logger.info("Stopping speaker-test pid=%s", tone.pid)
             os.killpg(tone.pid, signal.SIGTERM)
             tone.wait()
+        logger.info("Hardware alert finished frequency_hz=%s speaker_returncode=%s", freq_hz, tone.returncode)
 
 
 def prefer_h264(transceiver):
@@ -309,7 +323,8 @@ def log_startup_config(ice_servers: list[RTCIceServer]):
     logger.info(
         "RPI WebRTC config env_file_loaded=%s webrtc_ice_servers_present=%s "
         "ice_server_count=%s camera_id=%s ml_offer_url=%s sample_fps=%.2f "
-        "confidence_threshold=%.2f use_pose_detection=%s",
+        "confidence_threshold=%.2f use_pose_detection=%s orchestrator_events_url=%s "
+        "orchestrator_ws_url=%s audio_device=%s alert_seconds=%s pixel_pin=%s num_pixels=%s",
         ENV_FILE_LOADED,
         bool(os.getenv("WEBRTC_ICE_SERVERS")),
         len(ice_servers),
@@ -318,6 +333,12 @@ def log_startup_config(ice_servers: list[RTCIceServer]):
         WEBRTC_SAMPLE_FPS,
         WEBRTC_CONFIDENCE_THRESHOLD,
         WEBRTC_USE_POSE_DETECTION,
+        ORCHESTRATOR_EVENTS_URL,
+        ORCHESTRATOR_WS_URL,
+        AUDIO_DEVICE,
+        ALERT_SECONDS,
+        PIXEL_PIN,
+        NUM_PIXELS,
     )
     logger.info("RPI ICE servers summary=%s", summarize_ice_servers(ice_servers))
 
@@ -477,30 +498,66 @@ async def start_webrtc_stream_with_log():
             retry_delay = min(retry_delay * 2, 60)
 
 
-def incident_frequency(incident: dict) -> Optional[int]:
+def incident_alert_decision(incident: dict):
+    incident_id = incident.get("incident_id")
+    incident_type = incident.get("type")
     location = incident.get("location") or {}
-    if location.get("camera_id") != CAMERA_ID:
-        return None
+    incident_camera_id = location.get("camera_id")
+    logger.info(
+        "Evaluating incident incident_id=%s type=%s incident_camera_id=%s expected_camera_id=%s",
+        incident_id,
+        incident_type,
+        incident_camera_id,
+        CAMERA_ID,
+    )
+
+    if incident_camera_id != CAMERA_ID:
+        return None, "camera_mismatch"
 
     frequency = incident.get("speaker_frequency_hz") or incident.get("frequency_hz")
     if frequency:
-        return int(frequency)
+        return int(frequency), "payload_frequency"
 
-    return INCIDENT_FREQUENCIES.get(incident.get("type"))
+    fallback_frequency = INCIDENT_FREQUENCIES.get(incident_type)
+    if fallback_frequency:
+        return fallback_frequency, "type_default_frequency"
+
+    return None, "no_frequency_for_type"
+
+
+def incident_frequency(incident: dict) -> Optional[int]:
+    frequency, _reason = incident_alert_decision(incident)
+    return frequency
 
 
 async def process_incident(raw_data: str):
-    logger.info("Received incident event raw_data=%s", raw_data)
+    logger.info("Received incident event raw_bytes=%s raw_data=%s", len(raw_data.encode()), raw_data)
 
     try:
         incident = json.loads(raw_data)
-        frequency = incident_frequency(incident)
+        frequency, reason = incident_alert_decision(incident)
+        incident_id = incident.get("incident_id")
+        incident_type = incident.get("type")
+        incident_camera_id = (incident.get("location") or {}).get("camera_id")
         if frequency:
-            logger.info("Triggering hardware alert frequency_hz=%s", frequency)
+            logger.info(
+                "Triggering hardware alert incident_id=%s type=%s frequency_hz=%s reason=%s camera_id=%s",
+                incident_id,
+                incident_type,
+                frequency,
+                reason,
+                incident_camera_id,
+            )
             await asyncio.to_thread(alert_hardware, frequency)
+            logger.info("Hardware alert completed incident_id=%s frequency_hz=%s", incident_id, frequency)
         else:
             logger.info(
-                "Incident received but ignored reason=camera_mismatch_or_no_frequency"
+                "Incident ignored incident_id=%s type=%s reason=%s incident_camera_id=%s expected_camera_id=%s",
+                incident_id,
+                incident_type,
+                reason,
+                incident_camera_id,
+                CAMERA_ID,
             )
     except Exception as inner_exc:
         logger.exception("Failed to process incident payload error=%r", inner_exc)
@@ -508,30 +565,72 @@ async def process_incident(raw_data: str):
 
 async def listen_for_alerts_sse():
     timeout = httpx.Timeout(connect=10, read=35, write=10, pool=10)
+    logger.info(
+        "Connecting to SSE alert stream url=%s timeout_connect_s=10 timeout_read_s=35",
+        ORCHESTRATOR_EVENTS_URL,
+    )
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("GET", ORCHESTRATOR_EVENTS_URL) as response:
             response.raise_for_status()
-            logger.info("Connected to SSE alert stream url=%s", ORCHESTRATOR_EVENTS_URL)
+            logger.info(
+                "Connected to SSE alert stream url=%s status=%s content_type=%s",
+                ORCHESTRATOR_EVENTS_URL,
+                response.status_code,
+                response.headers.get("content-type"),
+            )
 
             event_name = "message"
             data_lines = []
+            event_count = 0
+            line_count = 0
 
             async for line in response.aiter_lines():
+                line_count += 1
                 if line == "":
+                    event_count += 1
+                    logger.info(
+                        "SSE event boundary event_index=%s event_name=%s data_line_count=%s",
+                        event_count,
+                        event_name,
+                        len(data_lines),
+                    )
                     if event_name == "incident" and data_lines:
+                        logger.info(
+                            "Dispatching SSE incident event_index=%s data_line_count=%s",
+                            event_count,
+                            len(data_lines),
+                        )
                         await process_incident("\n".join(data_lines))
+                    elif event_name != "message" or data_lines:
+                        logger.info(
+                            "Ignoring non-incident SSE event event_index=%s event_name=%s data=%s",
+                            event_count,
+                            event_name,
+                            "\n".join(data_lines),
+                        )
 
                     event_name = "message"
                     data_lines = []
                     continue
 
                 if line.startswith(":"):
+                    logger.info("SSE comment received line_index=%s value=%s", line_count, line)
                     continue
 
                 if line.startswith("event:"):
                     event_name = line[len("event:") :].strip()
+                    logger.info("SSE event name received line_index=%s event_name=%s", line_count, event_name)
                 elif line.startswith("data:"):
-                    data_lines.append(line[len("data:") :].strip())
+                    data = line[len("data:") :].strip()
+                    data_lines.append(data)
+                    logger.info(
+                        "SSE data line received line_index=%s event_name=%s data_bytes=%s",
+                        line_count,
+                        event_name,
+                        len(data.encode()),
+                    )
+                else:
+                    logger.info("SSE unhandled line received line_index=%s line=%s", line_count, line)
 
 
 async def listen_for_alerts_websocket():

@@ -82,8 +82,8 @@ def configure_logging():
 
 configure_logging()
 
-ML_WEBRTC_OFFER_URL = "https://wildsafe-ml-service-4z6c.onrender.com/predict/webrtc/offer"
-ML_HEALTH_URL = "https://wildsafe-ml-service-4z6c.onrender.com/health"
+ML_WEBRTC_OFFER_URL = "https://wildsafe-ml-service.onrender.com/predict/webrtc/offer"
+ML_HEALTH_URL = "https://wildsafe-ml-service.onrender.com/health"
 ORCHESTRATOR_EVENTS_URL = os.getenv("ORCHESTRATOR_EVENTS_URL", "https://smart-wild.onrender.com/events")
 ORCHESTRATOR_WS_URL = os.getenv("ORCHESTRATOR_WS_URL", "wss://smart-wild.onrender.com/handshake")
 

@@ -24,15 +24,15 @@ from aiortc.contrib.media import MediaPlayer
 from aiortc.rtcicetransport import parse_stun_turn_uri
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [rpi] %(message)s",
-)
 logger = logging.getLogger("wildsafe.rpi")
+LOG_FORMAT = "%(asctime)s %(levelname)s [rpi] %(message)s"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def load_env_file(path: str = ".env") -> bool:
     env_path = Path(path)
+    if not env_path.is_absolute():
+        env_path = SCRIPT_DIR / env_path
     if not env_path.exists():
         return False
 
@@ -59,11 +59,33 @@ def load_env_file(path: str = ".env") -> bool:
 
 
 ENV_FILE_LOADED = load_env_file()
+LOG_FILE = os.getenv("RPI_LOG_FILE", "/tmp/wildsafe-rpi-firmware.log")
+
+
+def configure_logging():
+    formatter = logging.Formatter(LOG_FORMAT)
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root_logger.addHandler(stream_handler)
+
+    try:
+        file_handler = logging.FileHandler(LOG_FILE)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    except Exception:
+        root_logger.exception("Failed to attach RPi log file path=%s", LOG_FILE)
+
+
+configure_logging()
 
 ML_WEBRTC_OFFER_URL = "https://wildsafe-ml-service-4z6c.onrender.com/predict/webrtc/offer"
 ML_HEALTH_URL = "https://wildsafe-ml-service-4z6c.onrender.com/health"
-ORCHESTRATOR_EVENTS_URL = "https://smart-wild.onrender.com/events"
-ORCHESTRATOR_WS_URL = "wss://smart-wild.onrender.com/handshake"
+ORCHESTRATOR_EVENTS_URL = os.getenv("ORCHESTRATOR_EVENTS_URL", "https://smart-wild.onrender.com/events")
+ORCHESTRATOR_WS_URL = os.getenv("ORCHESTRATOR_WS_URL", "wss://smart-wild.onrender.com/handshake")
 
 PIXEL_PIN = board.D18
 NUM_PIXELS = 9
@@ -697,6 +719,18 @@ async def cleanup():
 
 
 async def main():
+    logger.info(
+        "Firmware starting script=%s cwd=%s uid=%s env_file_loaded=%s log_file=%s "
+        "camera_id=%s orchestrator_events_url=%s orchestrator_ws_url=%s",
+        Path(__file__).resolve(),
+        Path.cwd(),
+        os.getuid() if hasattr(os, "getuid") else "unknown",
+        ENV_FILE_LOADED,
+        LOG_FILE,
+        CAMERA_ID,
+        ORCHESTRATOR_EVENTS_URL,
+        ORCHESTRATOR_WS_URL,
+    )
     led_off()
 
     webrtc_task = asyncio.create_task(start_webrtc_stream_with_log())

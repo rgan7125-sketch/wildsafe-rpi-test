@@ -379,8 +379,9 @@ async def start_webrtc_stream():
         "-t",
         "0",
         "--codec",
-        "h264",
-        "--inline",
+        "libav",
+        "--libav-format",
+        "mpegts",
         "--nopreview",
         "--width",
         "640",
@@ -397,14 +398,20 @@ async def start_webrtc_stream():
     rpicam_process = subprocess.Popen(
         rpicam_command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
     logger.info("rpicam-vid started pid=%s", rpicam_process.pid)
-    rpicam_monitor_task = None
+    rpicam_monitor_task = asyncio.create_task(monitor_rpicam_process(rpicam_process))
 
     player = MediaPlayer(
         rpicam_process.stdout,
-        format="h264",
+        format="mpegts",
+        options={
+            "fflags": "+genpts+nobuffer",
+            "flags": "low_delay",
+            "analyzeduration": "1000000",
+            "probesize": "32768",
+        },
     )
     if player.video is None:
         raise RuntimeError("rpicam-vid did not produce a video track")

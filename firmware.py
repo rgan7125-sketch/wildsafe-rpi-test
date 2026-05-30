@@ -46,11 +46,14 @@ def load_env_file(path: str = ".env") -> bool:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if not key or key in os.environ:
+        if not key:
             continue
 
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
+
+        if key in os.environ and key != "WEBRTC_ICE_SERVERS":
+            continue
 
         os.environ[key] = value
         loaded = True

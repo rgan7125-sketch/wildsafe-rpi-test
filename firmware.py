@@ -90,10 +90,13 @@ ML_HEALTH_URL = "https://wildsafe-ml-service.onrender.com/health"
 ORCHESTRATOR_EVENTS_URL = os.getenv("ORCHESTRATOR_EVENTS_URL", "https://smart-wild.onrender.com/events")
 ORCHESTRATOR_WS_URL = os.getenv("ORCHESTRATOR_WS_URL", "wss://smart-wild.onrender.com/handshake")
 
+PIXEL_GPIO_PIN = 18
 PIXEL_PIN = board.D18
 NUM_PIXELS = 9
 BRIGHTNESS = 0.15
 ORDER = neopixel.GRB
+ALERT_COLOR = (255, 80, 0)
+LED_FLASH_INTERVAL_SECONDS = 0.2
 AUDIO_DEVICE = "plughw:3,0"
 ALERT_SECONDS = 5
 WEBRTC_SAMPLE_FPS = 3.0
@@ -107,13 +110,7 @@ ROAD_NAME = "CA-1"
 DIRECTION = "northbound"
 MILE_MARKER = "12.4"
 
-pixels = neopixel.NeoPixel(
-    PIXEL_PIN,
-    NUM_PIXELS,
-    brightness=BRIGHTNESS,
-    auto_write=False,
-    pixel_order=ORDER,
-)
+pixels: Optional[neopixel.NeoPixel] = None
 
 peer_connection = None
 rpicam_process = None
@@ -129,14 +126,67 @@ INCIDENT_FREQUENCIES = {
 }
 
 
-def led_off():
-    pixels.fill((0, 0, 0))
-    pixels.show()
+def init_pixels() -> neopixel.NeoPixel:
+    global pixels
+
+    if pixels is None:
+        logger.info(
+            "Initializing LED pixels gpio_pin=%s board_pin=%s num_pixels=%s brightness=%.2f order=%s",
+            PIXEL_GPIO_PIN,
+            PIXEL_PIN,
+            NUM_PIXELS,
+            BRIGHTNESS,
+            ORDER,
+        )
+        try:
+            pixels = neopixel.NeoPixel(
+                PIXEL_PIN,
+                NUM_PIXELS,
+                brightness=BRIGHTNESS,
+                auto_write=False,
+                pixel_order=ORDER,
+            )
+        except Exception:
+            logger.exception("LED pixel initialization failed gpio_pin=%s board_pin=%s", PIXEL_GPIO_PIN, PIXEL_PIN)
+            raise
+        logger.info("LED pixels initialized gpio_pin=%s num_pixels=%s", PIXEL_GPIO_PIN, NUM_PIXELS)
+
+    return pixels
 
 
-def led_alert(on: bool):
-    pixels.fill((255, 80, 0) if on else (0, 0, 0))
-    pixels.show()
+def led_off(reason: str = "manual"):
+    pixels = init_pixels()
+    try:
+        pixels.fill((0, 0, 0))
+        pixels.show()
+        logger.info("LED off gpio_pin=%s reason=%s", PIXEL_GPIO_PIN, reason)
+    except Exception:
+        logger.exception("LED off failed gpio_pin=%s reason=%s", PIXEL_GPIO_PIN, reason)
+        raise
+
+
+def led_alert(on: bool, flash_index: int):
+    pixels = init_pixels()
+    color = ALERT_COLOR if on else (0, 0, 0)
+    try:
+        pixels.fill(color)
+        pixels.show()
+        logger.info(
+            "LED flash gpio_pin=%s flash_index=%s state=%s color=%s",
+            PIXEL_GPIO_PIN,
+            flash_index,
+            "on" if on else "off",
+            color,
+        )
+    except Exception:
+        logger.exception(
+            "LED flash failed gpio_pin=%s flash_index=%s state=%s color=%s",
+            PIXEL_GPIO_PIN,
+            flash_index,
+            "on" if on else "off",
+            color,
+        )
+        raise
 
 
 def alert_hardware(freq_hz: int):
@@ -153,32 +203,47 @@ def alert_hardware(freq_hz: int):
     ]
 
     logger.info(
-        "Hardware alert starting frequency_hz=%s duration_s=%s audio_device=%s command=%s",
+        "Hardware alert starting frequency_hz=%s duration_s=%s audio_device=%s led_gpio_pin=%s led_pixels=%s led_interval_s=%.2f command=%s",
         freq_hz,
         ALERT_SECONDS,
         AUDIO_DEVICE,
+        PIXEL_GPIO_PIN,
+        NUM_PIXELS,
+        LED_FLASH_INTERVAL_SECONDS,
         command,
     )
-    tone = subprocess.Popen(command, start_new_session=True)
-    logger.info("speaker-test started pid=%s", tone.pid)
+    tone = None
+    try:
+        tone = subprocess.Popen(command, start_new_session=True)
+        logger.info("speaker-test started pid=%s", tone.pid)
+    except Exception:
+        logger.exception("speaker-test failed to start; continuing LED alert frequency_hz=%s", freq_hz)
+
     try:
         end_at = time.monotonic() + ALERT_SECONDS
         on = True
         flashes = 0
         while time.monotonic() < end_at:
-            led_alert(on)
+            led_alert(on, flashes + 1)
             on = not on
             flashes += 1
-            time.sleep(0.2)
+            time.sleep(LED_FLASH_INTERVAL_SECONDS)
         logger.info("LED alert loop finished flashes=%s", flashes)
     finally:
-        led_off()
-        logger.info("LED turned off after hardware alert")
-        if tone.poll() is None:
+        try:
+            led_off("hardware_alert_finished")
+            logger.info("LED turned off after hardware alert")
+        except Exception:
+            logger.exception("Failed to turn LED off after hardware alert")
+        if tone is not None and tone.poll() is None:
             logger.info("Stopping speaker-test pid=%s", tone.pid)
             os.killpg(tone.pid, signal.SIGTERM)
             tone.wait()
-        logger.info("Hardware alert finished frequency_hz=%s speaker_returncode=%s", freq_hz, tone.returncode)
+        logger.info(
+            "Hardware alert finished frequency_hz=%s speaker_returncode=%s",
+            freq_hz,
+            tone.returncode if tone is not None else None,
+        )
 
 
 def prefer_h264(transceiver):
@@ -349,7 +414,7 @@ def log_startup_config(ice_servers: list[RTCIceServer]):
         "RPI WebRTC config env_file_loaded=%s webrtc_ice_servers_present=%s "
         "ice_server_count=%s camera_id=%s ml_offer_url=%s sample_fps=%.2f "
         "confidence_threshold=%.2f use_pose_detection=%s orchestrator_events_url=%s "
-        "orchestrator_ws_url=%s audio_device=%s alert_seconds=%s pixel_pin=%s num_pixels=%s",
+        "orchestrator_ws_url=%s audio_device=%s alert_seconds=%s led_gpio_pin=%s led_board_pin=%s num_pixels=%s",
         ENV_FILE_LOADED,
         bool(os.getenv("WEBRTC_ICE_SERVERS")),
         len(ice_servers),
@@ -362,6 +427,7 @@ def log_startup_config(ice_servers: list[RTCIceServer]):
         ORCHESTRATOR_WS_URL,
         AUDIO_DEVICE,
         ALERT_SECONDS,
+        PIXEL_GPIO_PIN,
         PIXEL_PIN,
         NUM_PIXELS,
     )
@@ -741,7 +807,10 @@ async def main():
         ORCHESTRATOR_EVENTS_URL,
         ORCHESTRATOR_WS_URL,
     )
-    led_off()
+    try:
+        led_off("startup")
+    except Exception:
+        logger.exception("Failed to turn LED off during startup; continuing firmware startup")
 
     webrtc_task = asyncio.create_task(start_webrtc_stream_with_log())
     alerts_task = asyncio.create_task(listen_for_alerts())

@@ -7,7 +7,7 @@ import board
 import neopixel
 
 PIXEL_PIN = board.D18
-NUM_PIXELS = 9
+NUM_PIXELS = 8
 BRIGHTNESS = 0.15
 ORDER = neopixel.GRB
 

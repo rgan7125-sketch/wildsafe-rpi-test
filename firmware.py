@@ -104,8 +104,8 @@ WEBRTC_CONFIDENCE_THRESHOLD = 0.1
 WEBRTC_USE_POSE_DETECTION = False
 
 CAMERA_ID = os.getenv("RPI_CAMERA_ID", "rpi-roadside-001")
-LATITUDE = float(os.getenv("RPI_LATITUDE", "32.8815"))
-LONGITUDE = float(os.getenv("RPI_LONGITUDE", "-117.2350"))
+LATITUDE = float(os.getenv("RPI_LATITUDE", "32.8813349"))
+LONGITUDE = float(os.getenv("RPI_LONGITUDE", "-117.2348484"))
 ROAD_NAME = "Jacobs School of Engineering at UCSD"
 DIRECTION = "campus"
 MILE_MARKER = "local"
